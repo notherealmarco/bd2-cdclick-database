@@ -1,0 +1,702 @@
+
+--Recapiti dei clienti che hanno effettuato tra 1 e 3 ordini (di qualsiasi tipo) di progetti con masterizzazione e poi hanno richiesto la disabilitazione del profilo, data e motivazione, della disattivazione
+
+SELECT cf,
+	(
+		--trova i numeri di telefono del cliente
+		SELECT array_to_string(array_agg(telefono), ', ') AS telefoni 
+		FROM "telefoni_utenti"
+		WHERE "telefoni_utenti".cf = "utente_disattivato".cf
+	) as telefoni,
+	(
+		--trova gli indirizzi email del cliente
+		SELECT array_to_string(array_agg(email), ', ') AS telefoni
+		FROM "email_utenti"
+		WHERE "email_utenti".cf = "utente_disattivato".cf
+	) AS email,
+
+	data_disattivazione, motivo_disattivazione FROM "utente_disattivato"
+	WHERE cf IN (
+		--seleziona i clienti che rispettano le condizioni richieste
+		SELECT cliente FROM
+		(
+			--seleziona gli artisti che rispettano le condizioni richieste
+			SELECT id, artista as cliente FROM "ordine_artista"
+			WHERE ordine_artista.progetto IN
+				--seleziona i progetti con masterizzazione
+				(
+					SELECT progetto FROM "masterizzazione"
+				)
+			UNION ALL
+			--seleziona i privati che rispettano le condizioni richieste
+			SELECT id, privato as cliente FROM ordine_dettaglio
+			WHERE ordine_dettaglio.merce IN
+				--seleziona gli stock di progetti con masterizzazione
+				(
+					SELECT stock.id FROM stock
+				 	WHERE stock.id = ordine_dettaglio.merce
+				 	AND stock.progetto IN
+				 		--seleziona i progetti con masterizzazione
+				 		(
+							SELECT progetto FROM "masterizzazione"
+						)
+				)
+		) AS ordini_tot
+		GROUP BY cliente
+		--filtra per clienti con numero totale di ordini <= 3
+		HAVING COUNT(*) BETWEEN 1 AND 3
+	);
+
+
+
+--gli artisti in profitto (rispetto a quanto speso per gli ordini dropshipping) con le loro vendite al dettaglio
+SELECT DISTINCT artista FROM
+(
+	--calcola il profitto di ogni artista che ha fatto ordini dropshipping
+	--sottraendo il totale guadagnato al totale speso
+	--Un profitto negativo indica che attualmente è in perdita
+	SELECT artista, 
+		(
+			--calcola il totale guadagnato dalle vendite della vetrina
+			SELECT SUM(importo)
+			FROM split_artista
+			WHERE split_artista.artista = ordine_artista.artista
+		) - SUM(importo)
+
+	AS profitto FROM ordine_artista
+	WHERE tipo_ordine = 'dropshipping'
+	GROUP BY artista
+) AS profitto_artisti
+--filtra per gli artisti in profitto
+WHERE profitto > 0;
+
+
+
+--numero di packaging e dischi necessaria per produrre gli ordini la cui produzione non è stata completata
+
+WITH ordini_non_completati AS ( --ordini con produzione ancora in corso o mai iniziata
+	SELECT id, quantità, progetto FROM ordine_artista AS oa WHERE
+		--se la produzione è iniziata ma non finita
+		EXISTS (SELECT * FROM produzione AS prod
+				WHERE prod.id = oa.id
+			   	AND prod.data_fine IS NULL
+			   )
+	    --se la produzione non è mai iniziata
+		OR NOT EXISTS (SELECT * FROM produzione AS prod
+					  WHERE prod.id = oa.id
+					  )
+)
+--calcola il numero di packaging necessari divisi per nome del packaging
+SELECT SUM(quantità) AS quantità_necessaria, packaging AS prodotto, 'Packaging' AS tipo_prodotto
+FROM ordini_non_completati AS oa JOIN dettagli_progetto AS dp ON oa.progetto = dp.progetto
+GROUP BY packaging
+UNION
+--calcola il numero di dischi necessari divisi per tipo di disco
+SELECT SUM(quantità) AS quantità_necessaria, tipologia AS prodotto, 'Disco' AS tipo_prodotto
+FROM ordini_non_completati AS oa JOIN dettagli_progetto AS dp ON oa.progetto = dp.progetto
+GROUP BY tipologia;
+
+
+--Il numero medio di autori partecipanti a un progetto.
+--Considerando i soli progetti attualmente in vetrina ordinati almeno 10 volte da clienti privati non italiani.
+
+SELECT AVG(n_autori) FROM
+(
+	--calcola il numero di autori per ogni progetto
+	SELECT progetto.id,
+		(
+			SELECT COUNT(*) FROM "autori_progetti"
+			WHERE autori_progetti.progetto = progetto.id
+		) as n_autori
+
+		FROM progetto
+		--cerca i progetti ordinati almeno 10 volte da clienti privati
+		WHERE progetto.id IN
+			--verifica che esistano ordini dettaglio che si compongono di un qualsiasi stock
+			 --del progetto "progetto"
+			(SELECT progetto FROM
+			 	(
+					--conta gli ordini al dettaglio di ogni progetto
+					(SELECT COUNT(*), progetto.id as progetto FROM ordine_dettaglio
+						INNER JOIN progetto ON progetto.id IN
+					 		--condizione del join: associa a ogni ordine l'ID del progetto
+					 		--a cui si riferisce lo stock di cui l'ordine è composto
+					 		(SELECT progetto FROM stock WHERE stock.id = ordine_dettaglio.merce)
+
+				  	 WHERE privato IN
+					 	--filtra per i clienti privati non italiani
+ 					 	(SELECT cf FROM "dati_anagrafici" WHERE nazionalità <> 'Italia')
+					 GROUP BY progetto
+					 --filtra per progetti ordinati almeno 10 volte
+ 					 HAVING COUNT(*) >= 10
+ 				 	)
+			 	) as progetti_validi
+		    )
+		--filtra per i soli progetti in vetrina
+		AND "progetto".id IN
+			(SELECT "v".id FROM "vetrina_online" AS "v" WHERE "v".id = "progetto".id)
+
+) AS count_autori;
+
+
+
+--la somma delle quantità di tutti gli ordini massima mai raggiunta in un giorno, il giorno in cui è stata raggiunta e il numero di clienti (attivi) registrati fino a quel giorno
+-- la quantità complessiva di tutti gli ordini divisa per giorno
+WITH quantità_ordini_giornaliera AS (
+	SELECT quantità, data::DATE FROM ordine_artista
+	UNION
+	SELECT quantità, data::DATE FROM ordine_dettaglio
+)
+SELECT SUM(quantità) as quantità_totale, o1.data,
+	--clienti attivi fino al giorno 'o1.data'
+	(SELECT SUM(utenti) as utenti_registrati FROM
+	 	--utenti associati a clienti (e attivi) per giorno
+		(SELECT COUNT(*) utenti, data_registrazione::DATE FROM utente
+		 	WHERE (utente.cf IN (SELECT cf FROM privato)
+		    		OR utente.cf IN (SELECT cf from artista))
+		 		AND utente.attivo = TRUE
+			GROUP BY data_registrazione) as utenti_nuovi_per_giorno
+		WHERE
+		data_registrazione < o1.data)
+FROM quantità_ordini_giornaliera AS o1
+GROUP BY DATA;
+
+
+
+--Visualizzare, per ogni operaio, il numero delle produzioni partecipate con packaging senza inserti
+SELECT COUNT(*) AS n_prod, operaio FROM affidamento_produzione
+WHERE id IN (
+	-- ordini di progetti con packaging senza inserti
+	SELECT id FROM ordine_artista AS oa
+	-- verifica che l'ordine sia composto da un progetto con packaging senza inserti
+	WHERE (
+		SELECT COUNT(*) FROM dettagli_progetto AS dp JOIN packaging AS pkg ON dp.packaging = pkg.tipo
+			  WHERE dp.progetto = oa.progetto
+			  --se le dimensioni non sono specificate, il packaging ha inserti
+			  AND pkg.dim_inserto_front IS NULL
+			  AND pkg.dim_inserto_post IS NULL) > 0
+	)
+GROUP BY operaio;
+
+
+
+--Visualizzazione, per ogni produzione, del numero di operai coinvolti, della priorità dell'ordine, di id e titolo del progetto
+--e dello stato di completamento come 'completata' o 'in corso'
+SELECT prod.id, oa.progetto, oa.priorità, prog.titolo,
+(
+	--numero di operai coinvolti
+	SELECT COUNT(*) FROM affidamento_produzione as ap
+	WHERE ap.id = prod.id
+) AS n_operai,
+
+(
+	--stato di completamento della produzione
+	SELECT 'completata' WHERE data_fine IS NOT NULL
+	UNION
+	SELECT 'in corso' WHERE data_fine IS NULL
+) AS completamento
+
+FROM produzione AS prod, ordine_artista AS oa, progetto as prog
+WHERE oa.id = prod.id
+AND prog.id = oa.progetto;
+
+
+--Visualizzare lo stipendio medio degli operai che lavorano anche il weekend
+SELECT AVG(stipendio) FROM operaio as op
+    --filtra per operai che lavorano il weekend
+	WHERE EXISTS (SELECT * FROM turni_operai as turni
+				  WHERE turni.cf = op.cf
+				  AND (giorno_settimana = 'domenica' OR giorno_settimana = 'sabato')
+	);
+
+
+
+-- per ogni operaio, mostrare il numero di ore di lavoro che svolge durante il weekend e quelle durante i giorni feriali
+SELECT operaio.cf, stipendio, SUM(ora_fine - ora_inizio) AS ore_weekend,
+(
+	--ore di lavoro nei giorni feriali
+	SELECT SUM(ora_fine - ora_inizio) AS ore_feriali FROM turni_operai
+	JOIN operaio ON turni_operai.cf = operaio.cf
+	WHERE giorno_settimana <> 'domenica' AND giorno_settimana <> 'sabato'
+	GROUP BY operaio.cf
+) as ore_feriali
+
+FROM turni_operai
+JOIN operaio ON turni_operai.cf = operaio.cf
+WHERE giorno_settimana = 'domenica' OR giorno_settimana = 'sabato'
+GROUP BY operaio.cf;
+
+
+--Visualizzare il numero di ordini al dettaglio di clienti non italiani che si compongono di progetti creati da artisti italiani
+SELECT COUNT(*) FROM ordine_dettaglio
+	-- l'ordine deve arrivare da un cliente non italiano
+	WHERE EXISTS (SELECT * FROM dati_anagrafici WHERE cf = privato AND nazionalità <> 'Italia')
+	AND EXISTS (
+		SELECT * FROM stock, progetto
+		WHERE stock.id = ordine_dettaglio.merce
+		AND progetto.id = stock.progetto
+		AND EXISTS (
+			-- il progetto deve essere creato da un artista
+			-- di nazionalità italiana
+			SELECT * FROM dati_anagrafici WHERE cf = progetto.artista AND nazionalità = 'Italia')
+		);
+
+
+
+--Visualizzare, per ogni tipologia di disco, la priorità più utilizzata dagli ordini con quella tipologia da parte dei soli clienti stranieri (non italiani)
+--il numero totale di ordini ricevuti e il numero totale di ordini completati
+WITH utenti_non_italiani AS
+(
+	SELECT cf FROM dati_anagrafici WHERE nazionalità <> 'Italia'
+)
+
+SELECT tipologia, MAX(priorità) as priorità, COUNT(*) AS n_ordini,
+(
+	--numero di ordini completati
+	SELECT COUNT(*) FROM ordine_artista as oa, dettagli_progetto as dp2
+	WHERE oa.progetto = dp2.progetto
+	AND oa.artista IN
+		(SELECT cf FROM utenti_non_italiani)
+	AND oa.stato = 'completato'
+	AND dp2.tipologia = dp.tipologia
+) AS n_ordini_completati,
+(
+	--numero di artisti distinti
+	SELECT COUNT(*) FROM (
+		SELECT DISTINCT oa.artista FROM ordine_artista as oa, dettagli_progetto as dp3
+		WHERE oa.progetto = dp3.progetto
+		AND oa.artista IN
+			(SELECT cf FROM utenti_non_italiani)
+		AND dp3.tipologia = dp.tipologia
+	) AS n_artisti_distinti
+) AS n_artisti_distinti,
+
+(
+	--ordini di progetti con la masterizzazione
+	SELECT COUNT(*) FROM ordine_artista as oa, dettagli_progetto as dp4
+	WHERE oa.progetto = dp4.progetto
+	AND oa.artista IN
+		(SELECT cf FROM utenti_non_italiani)
+	AND dp4.tipologia = dp.tipologia
+	AND
+		(SELECT COUNT(*) FROM masterizzazione WHERE progetto = dp4.progetto) > 0
+) AS n_ordini_masterizzazione
+
+FROM ordine_artista as oa, dettagli_progetto as dp
+	WHERE oa.progetto = dp.progetto
+	AND oa.artista IN
+		(SELECT cf FROM utenti_non_italiani)
+	GROUP BY tipologia;
+
+
+
+--Visualizzare, per ogni giorno e tipologia di ordine, il numero totale e il numero medio di ordini complessivi ricevuto nell'ultimo mese, e la quantità media.
+--Tutto ordinato per data.
+SELECT ordine, data, COUNT(*) AS n_ordini, AVG(quantità) AS quantità_media
+FROM
+(
+	--ordini al dettaglio
+	SELECT 'dettaglio' AS ordine, id, privato AS cliente, quantità, data::DATE
+	FROM ordine_dettaglio
+	
+	UNION ALL
+	--ordini di artista (sia ingrosso che dropshipping)
+	SELECT 'artista' AS ordine, id, artista AS cliente, quantità, data::DATE
+	FROM ordine_artista
+
+) AS ordini
+
+WHERE data > CURRENT_DATE - INTERVAL '1 month'
+
+GROUP BY ordine, data
+ORDER BY data;
+
+
+--Visualizzare artista e numero totale di ordini del 20% degli artisti più attivi (con maggior numero di ordini)
+WITH conteggio_ordini AS
+(
+	--conta gli ordini di ogni artista
+	SELECT artista, COUNT(*) as ordini FROM "ordine_artista"
+	GROUP BY artista
+)
+--seleziona il primo 20% degli artisti
+SELECT * FROM "conteggio_ordini" c1 WHERE
+	(
+		SELECT COUNT(*) FROM "conteggio_ordini" c2
+		WHERE (c2.ordini >= c1.ordini)
+	--seleziona solo se nel primo 20%
+	) <= 0.2 * (
+					SELECT COUNT(*) FROM "conteggio_ordini"
+			   );
+
+
+--Visualizzazione dei dati degli artisti che hanno effettuato ordini di CD da meno di un anno su progetti più vecchi di 5 anni
+WITH ordini_recenti_di_progetti_datati AS
+(
+	--conta gli ordini e la quantità media ordinata per ogni artista
+	SELECT oa.artista, COUNT(*) as n_ordini, AVG(quantità) as quantità_media
+	FROM ordine_artista AS oa, progetto AS p, dettagli_progetto as dp
+
+	--ordinati da meno di un anno
+	WHERE data > CURRENT_DATE - INTERVAL '1 year'
+	AND p.id = oa.progetto
+	AND p.id = dp.progetto
+	AND tipologia = 'CD'
+	--progetti più vecchi di 5 anni
+	AND data_creazione < CURRENT_DATE - INTERVAL '5 year'
+	GROUP BY oa.artista
+)
+
+--concatena gli indirizzi email
+SELECT artista, n_ordini, quantità_media, array_to_string(array_agg(email), ', ') as indirizzi FROM email_utenti as email, ordini_recenti_di_progetti_datati as ord WHERE
+	email.cf = ord.artista
+GROUP BY artista, n_ordini, quantità_media;
+
+
+--Visualizzazione di numero ordine, tipologia di ordine, numero spedizione e recapiti telefonici del cliente le cui spedizioni (di ordini al dettaglio e all'ingrosso)
+--stanno subendo un ritardo
+WITH ordini_in_ritardo AS
+(
+	--tutti gli ordini al dettaglio in ritardo
+	SELECT 'dettaglio' AS ordine, id, privato AS cliente FROM ordine_dettaglio WHERE id_spedizione IN
+ 	(
+		 SELECT id FROM spedizione WHERE consegna_prevista < CURRENT_DATE
+		 AND stato <> 'consegnata'
+	)
+
+ 	UNION ALL
+ 	--tutti gli ordini all'ingrosso in ritardo
+ 	SELECT 'ingrosso' AS ordine, oi.id, artista AS cliente FROM ordine_ingrosso AS oi
+	JOIN ordine_artista AS oa ON oa.id = oi.id
+	WHERE id_spedizione IN
+ 	(
+		 --spedizioni in ritardo
+		 SELECT id FROM spedizione
+		 WHERE consegna_prevista < CURRENT_DATE
+		 AND stato <> 'consegnata'
+	)
+)
+
+--trova e concatena tutti i recapiti telefonici
+SELECT cliente, ordine, id, array_to_string(array_agg(telefono), ', ') as recapiti FROM telefoni_utenti as tel, ordini_in_ritardo as ord WHERE
+	tel.cf = ord.cliente
+GROUP BY id, ordine, cliente;
+
+
+--Visualizzazione di numero ordine, numero spedizione e indirizzi email del cliente le cui spedizioni (di ordini al dettaglio e all'ingrosso) sono arrivate in anticipo
+WITH ordini_in_anticipo AS
+(
+	SELECT 'dettaglio' AS ordine, id, privato AS cliente FROM ordine_dettaglio WHERE id_spedizione IN
+ 	(
+		--tutti gli ordini al dettaglio in ritardo
+		SELECT id FROM spedizione
+		WHERE consegna_prevista > CURRENT_DATE
+		AND stato = 'consegnata'
+	)
+
+ 	UNION ALL
+ 	--tutti gli ordini all'ingrosso in anticipo
+ 	SELECT 'ingrosso' AS ordine, oi.id, artista AS cliente FROM ordine_ingrosso as oi
+	JOIN ordine_artista AS oa ON oa.id = oi.id
+	WHERE id_spedizione IN
+ 	(
+		--spedizioni in anticipo
+		SELECT id FROM spedizione
+	 	WHERE consegna_prevista > CURRENT_DATE
+		AND stato = 'consegnata'
+	)
+)
+
+--trova e concatena tutti i recapiti telefonici
+SELECT cliente, ordine, id, array_to_string(array_agg(email), ', ') as indirizzi FROM email_utenti as email, ordini_in_anticipo as ord WHERE
+	email.cf = ord.cliente
+GROUP BY id, ordine, cliente;
+
+
+--Calcolo dell'importo di un'ordine artista dato il progetto di riferimento, la sua priorità, la quantità da ordinare e il metodo di pagamento
+--l'ID del progetto è id_prog
+--la quantità è ord_quantità
+--il metodo di pagamento è metodo_pag
+--la priorità è ord_priorità
+SELECT costo_copia * ord_quantità *
+	--aggiunge la maggiorazione del costo dovuta alla priorità scelta
+	(((SELECT maggiorazione_costo_pct FROM "priorità_ordine" WHERE priorità = ord_priorità) / 100) + 1) *
+	--aggiunge le commissioni del metodo di pagamento
+	(((SELECT commissione FROM "metodo_pagamento" WHERE id = metodo_pag) / 100) + 1)
+
+        FROM "costi_produzione_progetti" WHERE progetto = id_prog;
+
+
+--Calcolo del costo di produzione di un ordine con gli ultimi prezzi disponibili
+-- id_ord è l'ID dell'ordine di cui si vuole calcolare il costo della produzione
+
+WITH "progetto_quantità" AS
+    (SELECT progetto, quantità FROM "ordine_artista" WHERE id = id_ord)
+
+SELECT costo_copia *
+    --moltiplica il costo di una copia (dalla vista costi_produzione_progetti) per la quantità ordinata
+    (SELECT quantità FROM progetto_quantità)
+    FROM costi_produzione_progetti
+    WHERE progetto =
+        (SELECT progetto FROM progetto_quantità);
+
+--Calcolo dell'importo di un ordine al dettaglio dato lo stock di riferimento, la sua quantità e il metodo di pagamento scelto
+--lo stock riferito al progetto ordinato è id_stock
+--la quantità ordinata è ord_quantità
+--il metodo di pagamento è metodo_pagamento
+
+SELECT prezzo_unit * ord_quantità *
+(
+	(
+		(
+			SELECT commissione FROM "metodo_pagamento" WHERE id = metodo_pagamento
+		) / 100)
+	+ 1
+)
+FROM "vetrina_online", "stock" WHERE "stock".progetto = "vetrina_online".id AND "stock".id = id_stock;
+
+
+--Visualizzazione dei costi di produzione di tutti i progetti se dovessero essere prodotti nel momento di esecuzione della query
+SELECT "progetto".id AS "progetto",
+    (
+        SELECT (SUM(costo) + "tipo_dischi".costo + "packaging".costo) * "dettagli_progetto".n_dischi AS "costo_copia"
+		FROM
+		(
+			--costo della stampa del disco
+        	SELECT costo FROM "stampa_disco"
+			JOIN "tipo_stampe_dischi" ON "stampa_disco".tipo = "tipo_stampe_dischi".tipo
+                WHERE "stampa_disco".progetto = "progetto".id
+        	UNION ALL
+
+			--costo della masterizzazione
+        	SELECT costo FROM "masterizzazione"
+			JOIN "tipo_masterizzazione" ON "masterizzazione".tipo = "tipo_masterizzazione".tipo
+                WHERE "masterizzazione".progetto = "progetto".id
+        	UNION ALL
+
+			--costo della stampa degli inserti
+        	SELECT costo AS "costo" FROM "inserto"
+			JOIN "tipo_stampe_inserti" ON "inserto".stampa = "tipo_stampe_inserti".tipo
+                WHERE "inserto".progetto = "progetto".id
+        
+        UNION ALL SELECT 0
+
+    ) AS "costi_stampe_masterizzazione"
+)
+
+FROM "progetto", "dettagli_progetto", "packaging", "tipo_dischi"
+    WHERE "dettagli_progetto".progetto = "progetto".id
+    AND "packaging".tipo = "dettagli_progetto".packaging
+    AND "tipo_dischi".tipo = "dettagli_progetto".tipologia;
+
+
+
+
+-- RISCRITTE CON VISTE
+
+
+--Recapiti dei clienti che hanno effettuato tra 1 e 3 ordini (di qualsiasi tipo) di progetti con masterizzazione e poi hanno richiesto la disabilitazione del profilo, data e motivazione, della disattivazione
+
+WITH cliente_ordini_mast AS
+(
+	SELECT cliente, COUNT(*) AS n_ordini_mast FROM
+		(
+			--seleziona gli artisti che rispettano le condizioni richieste
+			SELECT id, artista as cliente FROM "ordine_artista"
+			WHERE ordine_artista.progetto IN
+				--seleziona i progetti con masterizzazione
+				(
+					SELECT progetto FROM "masterizzazione"
+				)
+			UNION ALL
+			--seleziona i privati che rispettano le condizioni richieste
+			SELECT id, privato as cliente FROM ordine_dettaglio
+			WHERE ordine_dettaglio.merce IN
+				--seleziona gli stock di progetti con masterizzazione
+				(
+					SELECT stock.id FROM stock
+				 	WHERE stock.id = ordine_dettaglio.merce
+				 	AND stock.progetto IN
+				 		--seleziona i progetti con masterizzazione
+				 		(
+							SELECT progetto FROM "masterizzazione"
+						)
+				)
+		) AS ordini_tot
+		GROUP BY cliente
+)
+
+SELECT cf,
+	(
+		--trova i numeri di telefono del cliente
+		SELECT array_to_string(array_agg(telefono), ', ') AS telefoni 
+		FROM "telefoni_utenti"
+		WHERE "telefoni_utenti".cf = "utente_disattivato".cf
+	) as telefoni,
+	(
+		--trova gli indirizzi email del cliente
+		SELECT array_to_string(array_agg(email), ', ') AS telefoni
+		FROM "email_utenti"
+		WHERE "email_utenti".cf = "utente_disattivato".cf
+	) AS email,
+
+	data_disattivazione, motivo_disattivazione FROM "utente_disattivato"
+	WHERE
+	(
+		SELECT n_ordini_mast FROM cliente_ordini_mast
+		WHERE cliente_ordini_mast.cliente = cf
+	) BETWEEN 1 AND 3;
+
+
+
+--Il numero medio di autori partecipanti a un progetto.
+--Considerando i soli progetti attualmente in vetrina ordinati almeno 10 volte da clienti privati non italiani.
+
+WITH prog_10_no_italy AS
+(
+	SELECT COUNT(*), progetto.id AS progetto FROM ordine_dettaglio
+						INNER JOIN progetto ON progetto.id IN
+					 		--condizione del join: associa a ogni ordine l'ID del progetto
+					 		--a cui si riferisce lo stock di cui l'ordine è composto
+					 		(SELECT progetto FROM stock WHERE stock.id = ordine_dettaglio.merce)
+
+				  	 WHERE privato IN
+					 	--filtra per i clienti privati non italiani
+ 					 	(SELECT cf FROM "dati_anagrafici" WHERE nazionalità <> 'Italia')
+					 GROUP BY progetto
+					 --filtra per progetti ordinati almeno 10 volte
+ 					 HAVING COUNT(*) >= 10
+ 	
+)
+
+SELECT AVG(n_autori) FROM
+(
+	--calcola il numero di autori per ogni progetto
+	SELECT progetto.id,
+		(
+			SELECT COUNT(*) FROM "autori_progetti"
+			WHERE autori_progetti.progetto = progetto.id
+		) AS n_autori
+
+		FROM progetto INNER JOIN prog_10_no_italy
+		ON prog_10_no_italy.progetto = progetto.id
+
+		--filtra per i soli progetti in vetrina
+		AND "progetto".id IN
+			(SELECT "v".id FROM "vetrina_online" AS "v" WHERE "v".id = "progetto".id)
+
+) AS count_autori;
+
+
+
+--Visualizzare, per ogni operaio, il numero delle produzioni partecipate con packaging senza inserti
+
+WITH prog_no_ins AS
+(
+	SELECT progetto, COUNT(*) FROM dettagli_progetto AS dp JOIN packaging AS pkg ON dp.packaging = pkg.tipo
+			  WHERE pkg.dim_inserto_front IS NULL
+			  AND pkg.dim_inserto_post IS NULL
+	GROUP BY progetto
+)
+
+SELECT COUNT(*) AS n_prod, operaio FROM affidamento_produzione, ordine_artista, prog_no_ins
+WHERE affidamento_produzione.id = ordine_artista.id
+AND ordine_artista.progetto = prog_no_ins.progetto
+GROUP BY operaio;
+
+
+
+--Visualizzare il numero di ordini al dettaglio di clienti non italiani che si compongono di progetti creati da artisti italiani
+
+WITH stock_progetti_italiani AS
+(
+	SELECT stock.id FROM stock JOIN progetto
+	ON progetto.id = stock.progetto
+	WHERE EXISTS
+	(
+		-- il progetto deve essere creato da un artista
+		-- di nazionalità italiana
+		SELECT * FROM dati_anagrafici
+		WHERE cf = progetto.artista AND nazionalità = 'Italia'
+	)
+)
+
+SELECT COUNT(*) FROM ordine_dettaglio, stock_progetti_italiani
+	WHERE ordine_dettaglio.merce = stock_progetti_italiani.id
+	-- l'ordine deve arrivare da un cliente non italiano
+	AND EXISTS (SELECT * FROM dati_anagrafici WHERE cf = privato AND nazionalità <> 'Italia');
+
+
+
+--Visualizzare, per ogni giorno e tipologia di ordine, il numero totale e il numero medio di ordini complessivi ricevuto nell'ultimo mese, e la quantità media.
+--Tutto ordinato per data.
+
+WITH ordini_complessivi AS
+(
+	--ordini al dettaglio
+	SELECT 'dettaglio' AS ordine, id, privato AS cliente, quantità, data::DATE
+	FROM ordine_dettaglio
+
+	UNION ALL
+	--ordini di artista (sia ingrosso che dropshipping)
+	SELECT 'artista' AS ordine, id, artista AS cliente, quantità, data::DATE
+	FROM ordine_artista
+)
+
+SELECT ordine, data, COUNT(*) AS n_ordini, AVG(quantità) AS quantità_media
+FROM ordini_complessivi
+WHERE data > CURRENT_DATE - INTERVAL '1 month'
+
+GROUP BY ordine, data
+ORDER BY data;
+
+
+
+--Visualizzazione, per ogni produzione, del numero di operai coinvolti, della priorità dell'ordine, di id e titolo del progetto
+--e dello stato di completamento come 'completata' o 'in corso'
+
+CREATE OR REPLACE TEMPORARY VIEW produzioni_stato(id, stato) AS
+(
+	SELECT id, 'completata' AS stato FROM produzione WHERE data_fine IS NOT NULL
+	UNION
+	SELECT id, 'in corso' AS stato FROM produzione WHERE data_fine IS NULL
+);
+CREATE OR REPLACE TEMPORARY VIEW operai_per_prod(id, n_operai) AS
+(
+	SELECT id, COUNT(*) AS n_operai FROM affidamento_produzione
+	GROUP BY id
+);
+
+SELECT prod.id, oa.progetto, oa.priorità, prog.titolo, operai_per_prod.n_operai, produzioni_stato.stato
+
+FROM produzione AS prod, ordine_artista AS oa, progetto as prog, produzioni_stato, operai_per_prod
+WHERE oa.id = prod.id
+AND prog.id = oa.progetto
+AND produzioni_stato.id = prod.id
+AND operai_per_prod.id = prod.id;
+
+
+--per ogni operaio, mostrare il numero di ore di lavoro che svolge durante il weekend e quelle durante i giorni feriali
+
+CREATE OR REPLACE TEMPORARY VIEW op_ore_weekend(cf, ore_weekend) AS
+(
+	SELECT cf, SUM(ora_fine - ora_inizio) AS ore_weekend
+	FROM turni_operai
+	WHERE giorno_settimana = 'domenica' OR giorno_settimana = 'sabato'
+	GROUP BY turni_operai.cf
+);
+
+CREATE OR REPLACE TEMPORARY VIEW op_ore_weekdays(cf, ore_feriali) AS
+(
+	SELECT cf, SUM(ora_fine - ora_inizio) AS ore_feriali
+	FROM turni_operai
+	WHERE giorno_settimana <> 'domenica' AND giorno_settimana <> 'sabato'
+	GROUP BY turni_operai.cf
+);
+
+SELECT DISTINCT operaio.cf, stipendio, ore_weekend, ore_feriali
+
+FROM turni_operai, operaio, op_ore_weekend, op_ore_weekdays
+WHERE turni_operai.cf = operaio.cf
+AND op_ore_weekend.cf = operaio.cf
+AND op_ore_weekdays.cf = operaio.cf;
