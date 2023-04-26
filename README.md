@@ -14,7 +14,7 @@ The project should not be considered production-ready.
 
 Il progetto non è da considerarsi production-ready. Non tutte le query sono state testate in un ambiente reale. Questa versione differisce dalla versione attualmente in produzione per [CD-Click](https://cdclick.it), che invece è una versione estesa di questo progetto e non rilasciata sotto licenza open source.
 
-So che pubblicare un pdf su git è tipo la peggior cosa che si possa fare, però ho la relazione solo in questo formato 🙁, vi consiglio di scaricarvi i file pdf localmente, il reader di GitHub è un po' meh.
+So che caricare un pdf su un repo git è tipo la peggior cosa che si possa fare, però ho la relazione solo in questo formato 🙁, vi consiglio di scaricarvi i file pdf localmente, il reader di GitHub è un po' meh.
 
 Per qualsiasi informazione non esitate a contattarmi 😉
 
